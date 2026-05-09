@@ -52,4 +52,9 @@ int edfs_new_inode(edfs_image_t *img,
                    edfs_inode_t *inode,
                    edfs_inode_type_t type);
 
+edfs_block_t edfs_find_free_block(edfs_image_t *img);
+int edfs_allocate_block(edfs_image_t *img, edfs_block_t block);
+int edfs_free_block(edfs_image_t *img, edfs_block_t block);
+edfs_block_t edfs_new_block(edfs_image_t *img);
+
 #endif /* __EDFS_COMMON_H__ */

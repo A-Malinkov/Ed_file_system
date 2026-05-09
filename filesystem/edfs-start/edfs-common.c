@@ -192,3 +192,139 @@ edfs_new_inode(edfs_image_t *img,
 
   return 0;
 }
+
+/*
+ * Block allocation routines
+ */
+
+/* Finds a free block in the bitmap.
+ * Returns the block number of the free block,
+ *  or EDFS_BLOCK_INVALID if no free block is available.
+ */
+edfs_block_t
+edfs_find_free_block(edfs_image_t *img)
+{
+  /* Read the bitmap */
+  uint8_t *bitmap = malloc(img->sb.bitmap_size);
+  if (bitmap == NULL) {
+    return EDFS_BLOCK_INVALID;
+  }
+
+  ssize_t bytes_read = pread(img->fd, bitmap, img->sb.bitmap_size, img->sb.bitmap_start);
+  if (bytes_read != img->sb.bitmap_size) {
+    free(bitmap);
+    return EDFS_BLOCK_INVALID;
+  }
+
+  /* Find a free block (bit set to 0) */
+  for (uint32_t byte_idx = 0; byte_idx < img->sb.bitmap_size; byte_idx++) {
+    if (bitmap[byte_idx] != 0xFF) {  /* Not all bits set */
+      for (int bit_idx = 0; bit_idx < 8; bit_idx++) {
+        if ((bitmap[byte_idx] & (1 << bit_idx)) == 0) {
+          edfs_block_t block = byte_idx * 8 + bit_idx + 1;  /* +1 because block 0 is invalid */
+          if (block < img->sb.n_blocks) {
+            free(bitmap);
+            return block;
+          }
+        }
+      }
+    }
+  }
+
+  free(bitmap);
+  return EDFS_BLOCK_INVALID;
+}
+
+/* Marks a block as allocated in the bitmap.
+ * Returns 0 on success, -1 on failure.
+ */
+int
+edfs_allocate_block(edfs_image_t *img, edfs_block_t block)
+{
+  if (block == EDFS_BLOCK_INVALID || block >= img->sb.n_blocks) {
+    return -1;
+  }
+
+  /* Calculate bitmap position */
+  uint32_t byte_idx = (block - 1) / 8;
+  int bit_idx = (block - 1) % 8;
+
+  /* Read the bitmap byte */
+  uint8_t bitmap_byte;
+  off_t offset = img->sb.bitmap_start + byte_idx;
+  ssize_t bytes_read = pread(img->fd, &bitmap_byte, 1, offset);
+  if (bytes_read != 1) {
+    return -1;
+  }
+
+  /* Set the bit */
+  bitmap_byte |= (1 << bit_idx);
+
+  /* Write back */
+  ssize_t bytes_written = pwrite(img->fd, &bitmap_byte, 1, offset);
+  return (bytes_written == 1) ? 0 : -1;
+}
+
+/* Marks a block as free in the bitmap.
+ * Returns 0 on success, -1 on failure.
+ */
+int
+edfs_free_block(edfs_image_t *img, edfs_block_t block)
+{
+  if (block == EDFS_BLOCK_INVALID || block >= img->sb.n_blocks) {
+    return -1;
+  }
+
+  /* Calculate bitmap position */
+  uint32_t byte_idx = (block - 1) / 8;
+  int bit_idx = (block - 1) % 8;
+
+  /* Read the bitmap byte */
+  uint8_t bitmap_byte;
+  off_t offset = img->sb.bitmap_start + byte_idx;
+  ssize_t bytes_read = pread(img->fd, &bitmap_byte, 1, offset);
+  if (bytes_read != 1) {
+    return -1;
+  }
+
+  /* Clear the bit */
+  bitmap_byte &= ~(1 << bit_idx);
+
+  /* Write back */
+  ssize_t bytes_written = pwrite(img->fd, &bitmap_byte, 1, offset);
+  return (bytes_written == 1) ? 0 : -1;
+}
+
+/* Allocates a new block, marks it as allocated, and zeros it out.
+ * Returns the block number on success, EDFS_BLOCK_INVALID on failure.
+ */
+edfs_block_t
+edfs_new_block(edfs_image_t *img)
+{
+  edfs_block_t block = edfs_find_free_block(img);
+  if (block == EDFS_BLOCK_INVALID) {
+    return EDFS_BLOCK_INVALID;
+  }
+
+  if (edfs_allocate_block(img, block) != 0) {
+    return EDFS_BLOCK_INVALID;
+  }
+
+  /* Zero out the block */
+  uint32_t block_offset = edfs_get_block_offset(&img->sb, block);
+  void *zero_buffer = calloc(1, img->sb.block_size);
+  if (zero_buffer == NULL) {
+    edfs_free_block(img, block);
+    return EDFS_BLOCK_INVALID;
+  }
+
+  ssize_t bytes_written = pwrite(img->fd, zero_buffer, img->sb.block_size, block_offset);
+  free(zero_buffer);
+
+  if (bytes_written != img->sb.block_size) {
+    edfs_free_block(img, block);
+    return EDFS_BLOCK_INVALID;
+  }
+
+  return block;
+}

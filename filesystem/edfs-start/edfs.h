@@ -150,7 +150,8 @@ edfs_get_n_blocks_per_indirect_block(const edfs_super_block_t *sb)
 static inline uint32_t
 edfs_get_block_offset(const edfs_super_block_t *sb, edfs_block_t block)
 {
-  return sb->block_size * block;
+  uint32_t data_start = sb->inode_table_start + sb->inode_table_size;
+  return data_start + (block - 1) * sb->block_size;
 }
 
 /* Returns the offset in bytes of an inode with number @inumber.
