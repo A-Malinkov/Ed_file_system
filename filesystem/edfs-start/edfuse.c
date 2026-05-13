@@ -192,6 +192,10 @@ edfs_find_inode(edfs_image_t *img,
      * Find the directory entry in @current_inode with that has the same
      * filename as @direntry, and store its inode number in direntry.inumber.
      */
+    /* TODO: It is a good idea to write a separate function to visit each
+     * directory entry, so you can reuse it later on. Consider using a callback
+     * mechanism: see "Functiepointers" in the Skillsdoc (in Dutch).
+     */
     edfs_find_dir_entry_data_t data = {
       .filename = cur,
       .entry = &direntry,
@@ -215,6 +219,62 @@ edfs_find_inode(edfs_image_t *img,
   return true;
 }
 
+
+
+/* Find the inode of the directory that contains @path.
+ * Returns whether the inode was found.
+ *
+ * (This function is not used yet, but will be useful for your implementation.)
+ */
+static bool
+edfs_find_parent_inode(edfs_image_t *img,
+                       const char *path,
+                       edfs_inode_t *inode)
+{
+  /* Drop trailing slashes */
+  size_t len = strlen(path);
+  while(len > 0 && path[len - 1] == '/'){
+    len--;
+  }
+
+  /* Isolate last part */
+  const char *last = memrchr(path, '/', len);
+  if(last == NULL)
+    last = path;
+
+  char *dirname = strndup(path, (last - path));
+  if(dirname == NULL)
+    return false;
+
+  bool found = edfs_find_inode(img, dirname, inode);
+  free(dirname);
+  return found;
+}
+
+/* Returns the basename (the actual name of the file) of the @path.
+ * The return value must be freed.
+ *
+ * (This function is not used yet, but will be useful for your implementation.)
+ */
+static char *
+edfs_get_basename(const char *path)
+{
+  /* Drop trailing slashes */
+  size_t len = strlen(path);
+  while(len > 0 && path[len - 1] == '/'){
+    len--;
+  }
+
+  /* Isolate last part */
+  const char *last = memrchr(path, '/', len);
+  if(last != NULL){
+    last++;
+  }else{
+    last = path;
+  }
+  return strndup(last, len - (last - path));
+}
+
 /*
  * Implementation of necessary FUSE operations.
  */
@@ -225,10 +285,16 @@ edfs_find_inode(edfs_image_t *img,
  *  -ENOENT if @path could not be found,
  *  -ENOTDIR if @path is not a directory.
  */
+
 static int
 edfuse_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                off_t offset, struct fuse_file_info *fi)
 {
+  /* TODO: Implement.
+   *
+   * Read @size bytes of data from the file at @path starting at @offset and
+   * write this to @buf.
+   */
   edfs_image_t *img = get_edfs_image();
   edfs_inode_t inode = {0,};
 
