@@ -42,6 +42,194 @@ edfs_read_block(edfs_image_t *img, edfs_block_t block, void *buf, size_t size)
 }
 
 static int
+edfs_write_block(edfs_image_t *img, edfs_block_t block, const void *buf, size_t size)
+{
+  if(block == EDFS_BLOCK_INVALID)
+    return -EINVAL;
+
+  if(size > img->sb.block_size)
+    size = img->sb.block_size;
+
+  off_t offset = edfs_get_block_offset(&img->sb, block);
+  return pwrite(img->fd, buf, size, offset);
+}
+
+static bool
+edfs_is_block_free(edfs_image_t *img, edfs_block_t block)
+{
+  if(block >= img->sb.n_blocks)
+    return false;
+
+  uint32_t byte_offset = img->sb.bitmap_start + (block / 8);
+  uint8_t bit_mask = 1 << (block % 8);
+
+  uint8_t byte;
+  if(pread(img->fd, &byte, 1, byte_offset) != 1)
+    return false;
+
+  return (byte & bit_mask) == 0;
+}
+
+static int
+edfs_set_block_used(edfs_image_t *img, edfs_block_t block, bool used)
+{
+  if(block >= img->sb.n_blocks)
+    return -EINVAL;
+
+  uint32_t byte_offset = img->sb.bitmap_start + (block / 8);
+  uint8_t bit_mask = 1 << (block % 8);
+
+  uint8_t byte;
+  if(pread(img->fd, &byte, 1, byte_offset) != 1)
+    return -EIO;
+
+  if(used)
+    byte |= bit_mask;
+  else
+    byte &= ~bit_mask;
+
+  if(pwrite(img->fd, &byte, 1, byte_offset) != 1)
+    return -EIO;
+
+  return 0;
+}
+
+static edfs_block_t
+edfs_find_free_block(edfs_image_t *img)
+{
+  for(edfs_block_t block = 1; block < img->sb.n_blocks; block++){
+    if(edfs_is_block_free(img, block))
+      return block;
+  }
+  return EDFS_BLOCK_INVALID;
+}
+
+static int
+edfs_allocate_block(edfs_image_t *img, edfs_block_t *block)
+{
+  *block = edfs_find_free_block(img);
+  if(*block == EDFS_BLOCK_INVALID)
+    return -ENOSPC;
+
+  return edfs_set_block_used(img, *block, true);
+}
+
+static int
+edfs_free_block(edfs_image_t *img, edfs_block_t block)
+{
+  return edfs_set_block_used(img, block, false);
+}
+
+static int
+edfs_zero_block(edfs_image_t *img, edfs_block_t block)
+{
+  char *zeros = calloc(1, img->sb.block_size);
+  if(zeros == NULL)
+    return -ENOMEM;
+
+  int ret = edfs_write_block(img, block, zeros, img->sb.block_size);
+  free(zeros);
+  return ret;
+}
+
+static int
+edfs_add_dir_entry(edfs_image_t *img, edfs_inode_t *dir_inode, const char *filename, edfs_inumber_t inumber)
+{
+  edfs_dir_entry_t entry = { .inumber = inumber };
+  strncpy(entry.filename, filename, EDFS_FILENAME_SIZE - 1);
+  entry.filename[EDFS_FILENAME_SIZE - 1] = '\0';
+
+  // Use the first directory data block only.
+  // If the directory does not have a block yet, allocate a block.
+  edfs_block_t block = dir_inode->inode.blocks[0];
+  if(block == EDFS_BLOCK_INVALID){
+    int rc = edfs_allocate_block(img, &block);
+    if(rc < 0)
+      return rc;
+
+    dir_inode->inode.blocks[0] = block;
+    if(edfs_zero_block(img, block) < 0)
+      return -EIO;
+    if(edfs_write_inode(img, dir_inode) < 0)
+      return -EIO;
+  }
+
+  char *buf = malloc(img->sb.block_size);
+  if(buf == NULL)
+    return -ENOMEM;
+
+  if(edfs_read_block(img, block, buf, img->sb.block_size) < 0){
+    free(buf);
+    return -EIO;
+  }
+
+  edfs_dir_entry_t *entries = (edfs_dir_entry_t *)buf;
+  int n_entries = img->sb.block_size / sizeof(edfs_dir_entry_t);
+  for(int i = 0; i < n_entries; i++){
+    if(entries[i].inumber == 0){
+      entries[i] = entry;
+      if(edfs_write_block(img, block, buf, img->sb.block_size) < 0){
+        free(buf);
+        return -EIO;
+      }
+      free(buf);
+      return 0;
+    }
+  }
+
+  free(buf);
+  return -ENOSPC;
+}
+
+static int
+edfs_remove_dir_entry(edfs_image_t *img, edfs_inode_t *dir_inode, const char *filename)
+{
+  edfs_block_t block = dir_inode->inode.blocks[0];
+  if(block == EDFS_BLOCK_INVALID)
+    return -ENOENT;
+
+  char *buf = malloc(img->sb.block_size);
+  if(buf == NULL)
+    return -ENOMEM;
+  if(edfs_read_block(img, block, buf, img->sb.block_size) < 0){
+    free(buf);
+    return -EIO;
+  }
+
+  edfs_dir_entry_t *entries = (edfs_dir_entry_t *)buf;
+  int n_entries = img->sb.block_size / sizeof(edfs_dir_entry_t);
+  for(int i = 0; i < n_entries; i++){
+    if(entries[i].inumber != 0 && strcmp(entries[i].filename, filename) == 0){
+      entries[i].inumber = 0; // Mark as free
+      if(edfs_write_block(img, block, buf, img->sb.block_size) < 0){
+        free(buf);
+        return -EIO;
+      }
+      free(buf);
+      return 0;
+    }
+  }
+
+  free(buf);
+  return -ENOENT;
+}
+
+typedef struct {
+  bool found_extra;
+} edfs_dir_check_t;
+
+static int
+edfs_rmdir_check_cb(const edfs_dir_entry_t *entry, void *data)
+{
+  edfs_dir_check_t *check = data;
+  if(strcmp(entry->filename, ".") != 0 && strcmp(entry->filename, "..") != 0){
+    check->found_extra = true;
+    return 1;
+  }
+  return 0;
+}
+
+static int
 edfs_visit_dir_block(edfs_image_t *img,
                      edfs_block_t block,
                      int (*cb)(const edfs_dir_entry_t *, void *),
@@ -336,13 +524,83 @@ edfuse_mkdir(const char *path, mode_t mode)
    * Create a new inode; register it in the parent directory, write the inode
    * to disk.
    */
-  return -ENOSYS;
+  edfs_image_t *img = get_edfs_image();
+
+  edfs_inode_t inode;
+  if(edfs_find_inode(img, path, &inode))
+    return -EEXIST;
+
+  edfs_inode_t parent_inode;
+  char *basename = edfs_get_basename(path);
+  if(basename == NULL)
+    return -ENOMEM;
+
+  if(!edfs_find_parent_inode(img, path, &parent_inode)){
+    free(basename);
+    return -ENOENT;
+  }
+
+  if(!edfs_inode_is_directory(&parent_inode.inode)){
+    free(basename);
+    return -ENOTDIR;
+  }
+
+  edfs_inode_t new_inode;
+  if(edfs_new_inode(img, &new_inode, EDFS_INODE_TYPE_DIRECTORY) < 0){
+    free(basename);
+    return -ENOSPC;
+  }
+
+  edfs_block_t block;
+  if(edfs_allocate_block(img, &block) < 0){
+    free(basename);
+    return -ENOSPC;
+  }
+  new_inode.inode.blocks[0] = block;
+  if(edfs_zero_block(img, block) < 0){
+    free(basename);
+    return -EIO;
+  }
+
+  edfs_dir_entry_t dot = { .inumber = new_inode.inumber };
+  strncpy(dot.filename, ".", EDFS_FILENAME_SIZE - 1);
+  dot.filename[EDFS_FILENAME_SIZE - 1] = '\0';
+  edfs_dir_entry_t dotdot = { .inumber = parent_inode.inumber };
+  strncpy(dotdot.filename, "..", EDFS_FILENAME_SIZE - 1);
+  dotdot.filename[EDFS_FILENAME_SIZE - 1] = '\0';
+
+  char *buf = malloc(img->sb.block_size);
+  if(buf == NULL){
+    free(basename);
+    return -ENOMEM;
+  }
+  memset(buf, 0, img->sb.block_size);
+  memcpy(buf, &dot, sizeof(edfs_dir_entry_t));
+  memcpy(buf + sizeof(edfs_dir_entry_t), &dotdot, sizeof(edfs_dir_entry_t));
+  if(edfs_write_block(img, block, buf, img->sb.block_size) < 0){
+    free(buf);
+    free(basename);
+    return -EIO;
+  }
+  free(buf);
+
+  new_inode.inode.size = 2 * sizeof(edfs_dir_entry_t);
+  if(edfs_write_inode(img, &new_inode) < 0){
+    free(basename);
+    return -EIO;
+  }
+
+  if(edfs_add_dir_entry(img, &parent_inode, basename, new_inode.inumber) < 0){
+    edfs_free_block(img, block);
+    edfs_clear_inode(img, &new_inode);
+    free(basename);
+    return -ENOSPC;
+  }
+
+  free(basename);
+  return 0;
 }
 
-/* Removes the directory at @path.
- * Returns 0 on success,
- *  ...
- */
 static int
 edfuse_rmdir(const char *path)
 {
@@ -351,7 +609,55 @@ edfuse_rmdir(const char *path)
    * Validate @path exists and is an empty directory; remove directory entry
    * from its parent directory; release allocated blocks; release inode.
    */
-  return -ENOSYS;
+  edfs_image_t *img = get_edfs_image();
+  edfs_inode_t inode = {0,};
+
+  if(strcmp(path, "/") == 0)
+    return -EINVAL;
+
+  if(!edfs_find_inode(img, path, &inode))
+    return -ENOENT;
+  if(!edfs_inode_is_directory(&inode.inode))
+    return -ENOTDIR;
+
+  /* Verify directory is empty except for "." and "..". */
+  edfs_dir_check_t check = { .found_extra = false };
+  int rc = edfs_visit_directory_entries(img, &inode.inode,
+                                        edfs_rmdir_check_cb, &check);
+  if(rc == 1 || check.found_extra)
+    return -ENOTEMPTY;
+  if(rc < 0)
+    return -EIO;
+
+  char *basename = edfs_get_basename(path);
+  if(basename == NULL)
+    return -ENOMEM;
+
+  edfs_inode_t parent_inode;
+  if(!edfs_find_parent_inode(img, path, &parent_inode)){
+    free(basename);
+    return -ENOENT;
+  }
+
+  for(int i = 0; i < EDFS_INODE_N_BLOCKS; i++){
+    if(inode.inode.blocks[i] != EDFS_BLOCK_INVALID){
+      edfs_free_block(img, inode.inode.blocks[i]);
+      inode.inode.blocks[i] = EDFS_BLOCK_INVALID;
+    }
+  }
+
+  if(edfs_remove_dir_entry(img, &parent_inode, basename) < 0){
+    free(basename);
+    return -ENOENT;
+  }
+
+  if(edfs_clear_inode(img, &inode) < 0){
+    free(basename);
+    return -EIO;
+  }
+
+  free(basename);
+  return 0;
 }
 
 /* Sets @stbuf to the attributes of the file or directory at @path.
@@ -425,7 +731,55 @@ edfuse_create(const char *path, mode_t mode, struct fuse_file_info *fi)
    * Create a new inode; register it in the parent directory; write the inode
    * to disk.
    */
-  return -ENOSYS;
+
+
+  // issue : the func may leave orphaned/partial state when adding the directory entry fails
+  // but it seems like the assignment does not require handling this case, so we will ignore it for now
+  edfs_image_t *img = get_edfs_image();
+
+  edfs_inode_t inode;
+  // Turns out we need to check if the file already exists
+  if(edfs_find_inode(img, path, &inode))
+    return -EEXIST;
+
+  // Find parent directory
+  edfs_inode_t parent_inode;
+  char *basename = edfs_get_basename(path);
+  if(basename == NULL)
+    return -ENOMEM;
+
+  if(!edfs_find_parent_inode(img, path, &parent_inode)){
+    free(basename);
+    return -ENOENT;
+  }
+
+  if(!edfs_inode_is_directory(&parent_inode.inode)){
+    free(basename);
+    return -ENOTDIR;
+  }
+
+  // Create new inode for file
+  edfs_inode_t new_inode;
+  if(edfs_new_inode(img, &new_inode, EDFS_INODE_TYPE_FILE) < 0){
+    free(basename);
+    return -ENOSPC;
+  }
+
+  // Write the new inode to disk
+  if(edfs_write_inode(img, &new_inode) < 0){
+    free(basename);
+    return -EIO;
+  }
+
+  // Add directory entry to parent
+  if(edfs_add_dir_entry(img, &parent_inode, basename, new_inode.inumber) < 0){
+    edfs_clear_inode(img, &new_inode);
+    free(basename);
+    return -ENOSPC;
+  }
+
+  free(basename);
+  return 0;
 }
 
 /* Remove one of the links to @path. If the link count becomes zero, the
@@ -553,7 +907,67 @@ edfuse_write(const char *path, const char *buf, size_t size, off_t offset,
    * Allocate new blocks (and update the file size) if the @size or @offset
    * (or both) are larger than the file size. New blocks must be zeroed.
    */
-  return -ENOSYS;
+  edfs_image_t *img = get_edfs_image();
+  edfs_inode_t inode = {0,};
+
+  if(!edfs_find_inode(img, path, &inode))
+    return -ENOENT;
+  if(edfs_inode_is_directory(&inode.inode))
+    return -EISDIR;
+  if(size == 0)
+    return 0;
+
+  off_t new_size = offset + size;
+  if(new_size > inode.inode.size)
+    inode.inode.size = new_size;
+
+  uint32_t block_size = img->sb.block_size;
+  unsigned int start_block = offset / block_size;
+  unsigned int end_block = (offset + size - 1) / block_size;
+
+  size_t written = 0;
+  for(unsigned int i = start_block; i <= end_block && written < size; i++){
+    edfs_block_t block = EDFS_BLOCK_INVALID;
+    if(i < EDFS_INODE_N_BLOCKS){
+      block = inode.inode.blocks[i];
+      if(block == EDFS_BLOCK_INVALID){
+        int rc = edfs_allocate_block(img, &block);
+        if(rc < 0)
+          return rc;
+        inode.inode.blocks[i] = block;
+        if(edfs_zero_block(img, block) < 0)
+          return -EIO;
+      }
+    } else {
+      return -ENOSPC;
+    }
+
+    off_t block_offset = (i == start_block) ? (offset % block_size) : 0;
+    size_t to_write = block_size - block_offset;
+    if(to_write > size - written)
+      to_write = size - written;
+
+    char *block_buf = malloc(block_size);
+    if(block_buf == NULL)
+      return -ENOMEM;
+    if(edfs_read_block(img, block, block_buf, block_size) < 0){
+      free(block_buf);
+      return -EIO;
+    }
+    memcpy(block_buf + block_offset, buf + written, to_write);
+    if(edfs_write_block(img, block, block_buf, block_size) < 0){
+      free(block_buf);
+      return -EIO;
+    }
+    free(block_buf);
+
+    written += to_write;
+  }
+
+  if(edfs_write_inode(img, &inode) < 0)
+    return -EIO;
+
+  return written;
 }
 
 /* Change the size of the file at @path to @offset.
@@ -569,7 +983,53 @@ edfuse_truncate(const char *path, off_t offset)
    * smaller or larger than the current file size. Release now superfluous
    * blocks or allocate new blocks that are necessary to cover @offset bytes.
    */
-  return -ENOSYS;
+  edfs_image_t *img = get_edfs_image();
+  edfs_inode_t inode = {0,};
+
+  if(!edfs_find_inode(img, path, &inode))
+    return -ENOENT;
+  if(edfs_inode_is_directory(&inode.inode))
+    return -EISDIR;
+  if(offset < 0)
+    return -EINVAL;
+
+  uint32_t block_size = img->sb.block_size;
+  unsigned int new_blocks = 0;
+  if(offset > 0)
+    new_blocks = (offset + block_size - 1) / block_size;
+  unsigned int current_blocks = 0;
+  if(inode.inode.size > 0)
+    current_blocks = (inode.inode.size + block_size - 1) / block_size;
+
+  if(new_blocks > EDFS_INODE_N_BLOCKS)
+    return -ENOSPC;
+
+  if(new_blocks > current_blocks){
+    for(unsigned int i = current_blocks; i < new_blocks; i++){
+      if(inode.inode.blocks[i] == EDFS_BLOCK_INVALID){
+        edfs_block_t block;
+        int rc = edfs_allocate_block(img, &block);
+        if(rc < 0)
+          return rc;
+        inode.inode.blocks[i] = block;
+        if(edfs_zero_block(img, block) < 0)
+          return -EIO;
+      }
+    }
+  } else if(new_blocks < current_blocks){
+    for(unsigned int i = new_blocks; i < current_blocks; i++){
+      if(inode.inode.blocks[i] != EDFS_BLOCK_INVALID){
+        edfs_free_block(img, inode.inode.blocks[i]);
+        inode.inode.blocks[i] = EDFS_BLOCK_INVALID;
+      }
+    }
+  }
+
+  inode.inode.size = offset;
+  if(edfs_write_inode(img, &inode) < 0)
+    return -EIO;
+
+  return 0;
 }
 
 /*
